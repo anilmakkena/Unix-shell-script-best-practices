@@ -1,0 +1,537 @@
+#!/bin/ksh
+
+# +----------------------------------------------------------------------------+
+# |                          Jeffrey M. Hunter                                 |
+# |                      jhunter@idevelopment.info                             |
+# |                         www.idevelopment.info                              |
+# |----------------------------------------------------------------------------|
+# |      Copyright (c) 1998-2012 Jeffrey M. Hunter. All rights reserved.       |
+# |----------------------------------------------------------------------------|
+# | APPLICATION NAME					: CDD|Actimize|Oracle  Database        |
+# | FILE/SCRIPT NAME  					: db_build.ksh               		   |
+# | SOFTWARE/PROJECT PATH				: /opt/actimize						   |
+# | SEPARATE PATH FOR STORE THIS FILE	: /opt/actimize/CDDbin/RDC/            |
+# | AUTOSYS/CRONTAB JOB NAME    		: This script should be scheduled to   |
+#                                        run on a nightly basis                |
+# |                                      through CRON as the root user account.|                      
+# |                                                                            |
+# | PURPOSE    : Creates a physical standby database for the production server |
+# |              "orcl" using RMAN.                                            |
+# |                                                                            |
+# | PARAMETERS  : None                                                         |
+# | USAGE       :  ./db_build.ksh <full|incr>  								   |
+# | DEPENDENCIES: None														   |
+# |                                                                            |
+# | NOTE       : As with any code, ensure to test this script in a development |
+# |              environment before attempting to run it in production.        |
+# +----------------------------------------------------------------------------+
+
+# +------------------------------------------------------------------------------------------------------+
+# |                                                                            							 |
+# |                       			MODIFICATION SUMMARY 						           				 |
+# |                                                                            							 |
+# +------------------------------------------------------------------------------------------------------+
+# DATE			NAME			PROJECT				COMMENTS
+#------------   -------------   ----------          -------------------------------------------------
+# 29/MAR/2021	EKYC Dev Team	ABG-EDW-DFP			Host Variable Sourcing form cddServers.SourceMe
+# 29/MAR/2021	EKYC Dev Team	ABG-EDW-DFP			Host Variable Sourcing form cddServers.SourceMe
+# 29/MAR/2021	EKYC Dev Team	ABG-EDW-DFP			Host Variable Sourcing form cddServers.SourceMe
+# 29/MAR/2021	EKYC Dev Team	ABG-EDW-DFP			Host Variable Sourcing form cddServers.SourceMe
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
+#File Locations
+#The following standards apply to developed code
+#The following is a breakdown of the standard directory structure for a UNIX based server.
+#	Location Contents
+#•	<xxx>/ Base directory for project xxx. Where ‘xxx’ is the standard short code for the project e.g. “IFS/EDW/actimize/CDD” for project directory for the ETL tool.
+#•	/CDDstaging 	-->Location where files that are pulled from other systems are placed
+#•	/CDDdatasets 	-->Location where all the datasets will be created
+#					All incoming data files will be deposited in the project Inbox via either Eway or FTP. The ETL file processing will scan the Inbox on a regular interval for new files.
+#					The Inbox directory must be accessible {Read, Write, Delete permissions} by the DataStage/ETL processing as all incoming file are processed by DataStage 
+#					The Inbox directory has the following directory structure to differentiate the file types received by the application. 
+#					DATA IMPORT
+#					All incoming data files in inbox data will be process by PLSQL/ETL/DataStage and loaded into the Oracle Application Staging database. 
+#					The Staging database tables will be in exactly the same format as the incoming data file. 
+#					As soon as each dataset is loaded into the Application/Target database, the associated Staging tables will be cleared down ready for the next set of incoming data/batch data/delta load.
+#					The data will be transformed by DataStage into the appropriate data structure for the application database to facilitate the data load.
+#	/opt/actimize/CDD/CDDdata
+#		/opt/actimize/CDD/CDDdata/inbox|INCOMMING				--> Inbox top level directory
+#		........................./inbox|INCOMMING/OMINI
+#		........................./inbox|INCOMMING/WEB
+#		........................./inbox|INCOMMING/ECWIP_MO
+#		........................./inbox|INCOMMING/ECWIP_RESCORE
+#				........................./inbox|INCOMMING/RDC_AM
+#						........................./inbox|INCOMMING/RDC_AM/research     --> where error data files are placed which we need to research.
+#						........................./inbox|INCOMMING/RDC_AM/archive	  --> where archive files are placed when data is loaded successfully 
+#                                                                                     --> All data files that are successfully load or created will be written to  “archive” directory.  
+#						Outbox/OUTGOING
+#						All outgoing data files will be deposited in the project Outbox/OUTGOING. The Outbox will be setup to for Eway, 
+#						this will facilitate the distribution of the outgoing data files to the recipient and the archiving of the data files.
+#						DATA EXPORT
+#						The system exports a number of data files, generated by ETL/DataStage/PLSQL processes. The created data files are written to the project Outbox for distribution.
+#		/opt/actimize/CDD/CDDdata/outbox|OUTGOING				--> outbox top level directory
+#		........................./outbox|OUTGOING/RDC_AM/archive	  --> where archive files are placed when data is loaded successfully 
+#		........................./outbox|OUTGOING/RDC_AM/research     --> where error data files are placed which we need to research.
+#														research|Reject|CDDerr
+#														All data files that fail to load will be written to project “research|reject|CDDerr” directory. 
+#														The files can be moved back to the Inbox once the issue is resolved or sent back to the data provider.
+#														The standard reasons for files to be written to the reject directory are:-
+#														•	Unknown file type
+#														•	Incorrect Network
+#														•	Record count issues
+#														There are specific reasons, defined in the Use Cases for files to be written to the reject directory are:-
+#														•	Incorrect File sequence
+#
+#
+#•	/CDDexport 		-->Location where files are placed that will be exported to other systems.
+#•	/CDDarchive     -->Location where archive files are stored
+#•	/CDDbin 		-->Location where custom developed code is placed. This directory will be placed in the executable search path.
+#•	/CDDetc 		-->Location where miscellaneous data such as initialization files are placed.
+#•	/CDDlog 		-->Location where flat file logs are placed.
+#•	/CDDerr 		-->Location where error files are placed.
+#•	/CDDtmp 		-->Location for temporary files.
+#•	/CDDtools 		-->Location for Sourcing SCRIPT VARIABLES though SourceMe files
+#•	/CDDflags 		-->Location for Checks Script is Running Flag Files
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
+
+#Overview of Load Process
+#			Each batch load will,
+#			•	Copy data from Operational Database into staging area
+#			•	Transform and load the appropriate target CDS --> Data Mart
+#			•	Update Dimension Tables 
+#			•	Create identifiers for new dimension members
+#			•	Update any existing dimension information if changed
+#			•	Add Fact records with related keys
+#			•	Update Aggregates
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
+
+
+# +----------------------------------------------------------------------------+
+# |                                                                            |
+# |                       DEFINE ALL GLOBAL VARIABLES                          |
+# |                                                                            |
+# +----------------------------------------------------------------------------+
+
+# ----------------------------
+# SCRIPT NAME VARIABLES
+# ----------------------------
+VERSION="3.9"
+SCRIPT_NAME_FULL=$0
+SCRIPT_NAME=${SCRIPT_NAME_FULL##*/}
+SCRIPT_NAME_NOEXT=${SCRIPT_NAME%%\.ksh}
+
+# ----------------------------
+# SCRIPT PARAMETER VARIABLES
+# ----------------------------
+TARGET_DB_NAME=$1
+TARGET_SID=$2
+LISTENER_NAME=$3
+
+# ----------------------------
+# DATE VARIABLES
+# ----------------------------
+START_DATE=`date`
+CURRENT_YEAR=`${DATE_BIN} +"%Y"`;
+DATE_LOG=`date +%Y%m%d_%H%M`
+TODAY=${DATE_LOG}
+CURRENT_DOW_NUM=`${DATE_BIN} +"%w"`;      # - day of week (0..6); 0 is Sunday
+case ${CURRENT_DOW_NUM} in
+    0) CURRENT_DOW_NAME="Sunday" ;;
+    1) CURRENT_DOW_NAME="Monday" ;;
+    2) CURRENT_DOW_NAME="Tuesday" ;;
+    3) CURRENT_DOW_NAME="Wednesday" ;;
+    4) CURRENT_DOW_NAME="Thursday" ;;
+    5) CURRENT_DOW_NAME="Friday" ;;
+    6) CURRENT_DOW_NAME="Saturday" ;;
+    *) CURRENT_DOW_NAME="unknown" ;;
+esac
+
+# ----------------------------
+# CUSTOM DIRECTORIES
+# ----------------------------
+CUSTOM_ORACLE_DIR=/u01/app/oracle/dba_scripts
+CUSTOM_ORACLE_BIN_DIR=${CUSTOM_ORACLE_DIR}/bin
+CUSTOM_ORACLE_LIB_DIR=${CUSTOM_ORACLE_DIR}/lib
+CUSTOM_ORACLE_LOG_DIR=${CUSTOM_ORACLE_DIR}/log
+CUSTOM_ORACLE_OUT_DIR=${CUSTOM_ORACLE_DIR}/out
+CUSTOM_ORACLE_SQL_DIR=${CUSTOM_ORACLE_DIR}/sql
+CUSTOM_ORACLE_TEMP_DIR=${CUSTOM_ORACLE_DIR}/temp
+
+# ----------------------------
+# LOG FILE VARIABLES
+# ----------------------------
+LOG_FILE_NAME=${CUSTOM_ORACLE_LOG_DIR}/${SCRIPT_NAME_NOEXT}_${DATE_LOG}.log
+LOG_FILE_ARCHIVE_OBSOLETE_DAYS=7
+LOG_FILE_NAME=${CUSTOM_ORACLE_LOG_DIR}/${SCRIPT_NAME_NOEXT}_${UNIQUE_SCRIPT_IDENTIFIER}_${HOSTNAME_SHORT_UPPER}_${START_DATE_LOG}.log
+LOG_FILE_NAME_NODATE=${CUSTOM_ORACLE_LOG_DIR}/${SCRIPT_NAME_NOEXT}_${UNIQUE_SCRIPT_IDENTIFIER}_${HOSTNAME_SHORT_UPPER}.log
+CHECK_SCRIPT_RUNNING_FLAG_FILE=${CUSTOM_ORACLE_TEMP_DIR}/${SCRIPT_NAME_NOEXT}_${UNIQUE_SCRIPT_IDENTIFIER}_${HOSTNAME_SHORT_UPPER}.running
+SQL_OUTPUT_TEMP_FILE_NAME=${CUSTOM_ORACLE_TEMP_DIR}/${SCRIPT_NAME_NOEXT}_${UNIQUE_SCRIPT_IDENTIFIER}_${HOSTNAME_SHORT_UPPER}.lst
+
+# ----------------------------
+# EMAIL VARIABLES
+# ----------------------------
+MAIL_FILE_NAME=${CUSTOM_ORACLE_TEMP_DIR}/${SCRIPT_NAME_NOEXT}.mhr
+ERRORS="NO"
+# ----------------------------
+# EMAIL PREFERENCES
+# ----------------------------
+# LIST ALL ADMINISTRATIVE
+# EMAIL ADDRESSES WHO WILL BE
+# RESPONSIBLE FOR MONITORING
+# AND RECEIVING EMAIL FROM
+# THIS SCRIPT.
+# ----------------------------
+# THREE EMAIL RECIPIENT LISTS
+# EXIST:
+#   1) WHEN THIS SCRIPT CALLS
+#      exitSuccess()
+#   2) WHEN THIS SCRIPT CALLS
+#      exitWarning()
+#   3) WHEN THIS SCRIPT CALLS
+#      exitFailed()
+# ----------------------------
+# MULTIPLE EMAIL ADDRESSES
+# SHOULD ALL BE LISTED IN
+# DOUBLE-QUOTES SEPARATED BY A
+# SINGLE SPACE.
+# ----------------------------
+MAIL_RECIPIENT_LIST_EXIT_SUCCESS="jhunter@idevelopment.info"
+MAIL_RECIPIENT_LIST_EXIT_WARNING="jhunter@idevelopment.info dba@idevelopment.info"
+MAIL_RECIPIENT_LIST_EXIT_FAILED="jhunter@idevelopment.info support@idevelopment.info dba@idevelopment.info"
+MAIL_FROM="${ORGANIZATION_NAME} Database Support <dba@idevelopment.info>"
+MAIL_REPLYTO="${ORGANIZATION_NAME} Database Support <dba@idevelopment.info>"
+MAIL_TO_NAME="${ORGANIZATION_NAME} Database Support"
+MAIL_TEMP_FILE_NAME=${CUSTOM_ORACLE_TEMP_DIR}/${SCRIPT_NAME_NOEXT}_${UNIQUE_SCRIPT_IDENTIFIER}_${HOSTNAME_SHORT_UPPER}.mhr
+
+
+# ----------------------------
+# HOSTNAME VARIABLES
+# ----------------------------
+HOSTNAME=`hostname`
+HOSTNAME_UPPER=`hostname | tr '[:lower:]' '[:upper:]'`
+HOSTNAME_SHORT=${HOSTNAME%%\.*}
+HOSTNAME_SHORT_UPPER=`echo $HOSTNAME_SHORT | tr '[:lower:]' '[:upper:]'`
+
+# ----------------------------
+# ORACLE ENVIRONMENT VARIABLES
+# ----------------------------
+unset ORACLE_PATH
+unset SQLPATH
+ORACLE_BASE=/u01/app/oracle
+ORACLE_HOME=${ORACLE_BASE}/product/10.2.0/db_1
+ORACLE_ADMIN_DIR=${ORACLE_BASE}/admin
+
+# ----------------------------
+# CUSTOM SCRIPT VARIABLES
+# ----------------------------
+TARGET_DB=orcl
+AUXILIARY_DB=orclgs
+DG_STAGING_DIR=/u03/dg_staging
+REMOTE_SHELL_BINARY=/usr/bin/ssh
+REMOTE_COPY_BINARY=/usr/bin/scp
+REMOTE_COPY_SERVER=linuxgs
+REMOTE_COPY_DG_STAGING_DIR=/u03/dg_staging
+DBA_USERNAME=SYS
+SYS_PASSWORD=dbaz0n3
+
+# ------------------------------------------------------
+# Sourcing SCRIPT VARIABLES though SourceMe files
+# ------------------------------------------------------
+export CDDTOOLS=/opt/actimize/CDDtools
+source cddFilePaths.SourceMe
+source cddSqlplus.SourceMe
+source cddServers.SourceMe
+source cddMailto.SourceMe
+
+
+# +----------------------------------------------------------------------------+
+# |                                                                            |
+# |                       DEFINE ALL GLOBAL FUNCTIONS                          |
+# |                                                                            |
+# +----------------------------------------------------------------------------+
+
+function wl {
+
+  echo "${1}" >> ${LOG_FILE_NAME}
+  echo "${1}"
+
+}
+
+function startScript {
+
+  DATE_START=`date "+%m/%d/%Y %H:%M"`
+  echo "START: ${DATE_START}" > ${LOG_FILE_NAME}
+
+}
+
+function endScript {
+
+  DATE_END=`date "+%m/%d/%Y %H:%M"`
+  echo "END: ${DATE_END}" >> ${LOG_FILE_NAME}
+
+}
+
+showSignonBanner() {
+
+    wl " "
+    wl "${SCRIPT_NAME} - Version ${VERSION}"
+    wl "Copyright (c) 1998-${CURRENT_YEAR} Jeffrey M. Hunter. All rights reserved."
+    wl " "
+
+}
+
+function errorExit {
+
+  wl " "
+  wl "TRACE> CRITICAL ERROR"
+  wl "TRACE> Exiting script."
+  wl " "
+  exit 2
+}
+
+function check_already_running(){
+dupe_script=$(ps -ef | grep "SCRIPT_NAME.sh" | grep -v grep | wc -l | xargs)
+if [[ ${dupe_script} -gt 2 ]]; then
+    echo -e "The $SCRIPT_NAME.sh script was already running!"
+    exit 0
+else
+	echo "ok"
+fi
+}
+
+function checkScriptAlreadyRunning {
+
+    typeset -r L_SCRIPT_NAME=${1}
+    typeset -r L_UNIQUE_SCRIPT_IDENTIFIER=${2}
+    typeset    L_COMMAND
+
+    wl " "
+    wl "TRACE> Check that this script (${L_SCRIPT_NAME}) is not already running on this host."
+
+    wl " "
+    wl "TRACE> Looking for script run flag file (${CHECK_SCRIPT_RUNNING_FLAG_FILE})."
+
+    if [ -f $CHECK_SCRIPT_RUNNING_FLAG_FILE ]; then
+        wl " "
+        wl "TRACE> WARNING: Found ${L_SCRIPT_NAME} already running on this host. Exiting script."
+        exitFailed "RUNNING" ${L_UNIQUE_SCRIPT_IDENTIFIER}
+    else
+        wl " "
+        wl "TRACE> Did not find this script (${L_SCRIPT_NAME}) already running on this host. Setting run flag and continuing script..."
+        touch $CHECK_SCRIPT_RUNNING_FLAG_FILE
+    fi
+    wl " "
+
+    return
+
+}
+
+function exitSuccess {
+
+    typeset L_SEVERITY=${1}
+    typeset L_UNIQUE_SCRIPT_IDENTIFIER=${2}
+
+    wl " "
+    wl "TRACE> +----------------------------------------------+"
+    wl "TRACE> |                  SUCCESSFUL                  |"
+    wl "TRACE> +----------------------------------------------+"
+    wl " "
+    wl "TRACE> Exiting script (${HOST_RVAL_SUCCESS})."
+    wl " "
+
+    removeScriptRunFlagFile
+    stopLogging
+
+    backupCurrentLogFile
+
+    sendEmail ${L_SEVERITY} "${MAIL_RECIPIENT_LIST_EXIT_SUCCESS}" ${L_UNIQUE_SCRIPT_IDENTIFIER}
+
+    exit ${HOST_RVAL_SUCCESS}
+
+}
+# +----------------------------------------------------------------------------+
+# |                                                                            |
+# |                            SCRIPT STARTS HERE                              |
+# |                                                                            |
+# +----------------------------------------------------------------------------+
+
+startScript
+
+showSignonBanner
+
+
+wl " "
+wl "------------------------------------------------------------------------------"
+wl "This script will rebuild a physical standby database for the primary database "
+wl "running on this node. This script MUST be run from the node hosting the       "
+wl "primary production database. Continue - (y/[n])?"
+wl "------------------------------------------------------------------------------"
+wl " "
+
+read userResponse
+
+if [[ ${userResponse} == "" || ${userResponse} == "N" || ${userResponse} == "n" ]]; then
+    wl "Exiting script as per user request."
+    wl "Good-bye!"
+    wl " "
+    exit
+fi
+
+checkScriptAlreadyRunning $SCRIPT_NAME $UNIQUE_SCRIPT_IDENTIFIER
+
+wl " "
+wl "+----------------------------------------------------------------------------+"
+wl "| TEST LOGIN TO TARGET DATABASE                                              |"
+wl "+----------------------------------------------------------------------------+"
+
+$ORACLE_HOME/bin/sqlplus -s /nolog <<EOF | tee -a $LOG_FILE_NAME
+  whenever sqlerror exit failure
+  connect ${DBA_USERNAME}/${SYS_PASSWORD}@${TARGET_DB} as sysdba
+  set head off
+  set linesize 145
+  select 'TRACE> Successfully logged in to the target database (${TARGET_DB}) as the ' || user || ' user!' from dual;
+EOF
+
+if (( $? == 0 )); then
+  wl " "
+  wl "TRACE> Target database (${TARGET_DB}) IS running!"
+else 
+  wl " "
+  wl "TRACE> Target database (${TARGET_DB}) IS NOT running!"
+  errorExit
+fi
+
+#Check the databse connection
+CHECK=($ORACLE_HOME/bin/sqlplus -s /nolog <<EOF | tee -a $LOG_FILE_NAME
+  whenever sqlerror exit failure
+  connect ${DBA_USERNAME}/${SYS_PASSWORD}@${TARGET_DB} as sysdba
+  set head off
+  quit;
+EOF
+echo $?)
+
+if [[ $CHECK -ne 0 ]]; then
+  wl " "
+  wl "TRACE> Target database (${TARGET_DB}) IS NOT running!"
+    errorExit
+else 
+  wl " "
+  wl "TRACE> Target database (${TARGET_DB}) IS running!"
+fi
+
+
+mkdir -p ${DG_STAGING_DIR}
+
+COMMAND="${REMOTE_SHELL_BINARY} ${REMOTE_COPY_SERVER} mkdir -p ${REMOTE_COPY_DG_STAGING_DIR}"
+wl ${COMMAND}
+
+RESULTS=`${REMOTE_SHELL_BINARY} ${REMOTE_COPY_SERVER} "mkdir -p ${REMOTE_COPY_DG_STAGING_DIR}"`
+wl "RESULTS :  $RESULTS"
+
+if (( $? == 0 )); then
+  wl " "     
+  wl "TRACE> Successfully created ${REMOTE_COPY_DG_STAGING_DIR} on host (${REMOTE_COPY_SERVER})!"
+else     
+  wl " "
+  wl "TRACE> Failed to create ${REMOTE_COPY_DG_STAGING_DIR} directory on host (${REMOTE_COPY_SERVER})!"
+  errorExit                                                                  
+fi 
+
+
+wl " "
+wl "+----------------------------------------------------------------------------+"
+wl "| CREATE SCRIPTS TO BE EXECUTED ON REMOTE SERVER                             |"
+wl "+----------------------------------------------------------------------------+"
+
+# ---------------------------
+# REMOVE ASM FILES SQL SCRIPT
+# ---------------------------
+echo "SET LINESIZE  255
+SET PAGESIZE  9999
+SET VERIFY    off
+SET FEEDBACK  off
+SET HEAD      off
+COLUMN full_alias_path    FORMAT a255       HEAD 'File Name'
+COLUMN disk_group_name    noprint
+SELECT
+    'ALTER DISKGROUP '  ||
+        disk_group_name ||
+        ' DROP FILE ''' || CONCAT('+' || disk_group_name, SYS_CONNECT_BY_PATH(alias_name, '/')) || ''';' full_alias_path
+FROM
+    ( SELECT
+          g.name               disk_group_name
+        , a.parent_index       pindex
+        , a.name               alias_name
+        , a.reference_index    rindex
+        , f.type               type
+      FROM
+          v\$asm_file f RIGHT OUTER JOIN v\$asm_alias     a USING (group_number, file_number)
+                                   JOIN v\$asm_diskgroup g USING (group_number)
+    )
+WHERE type IS NOT NULL
+START WITH (MOD(pindex, POWER(2, 24))) = 0
+    CONNECT BY PRIOR rindex = pindex
+/
+exit
+" > ${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files.sql
+
+
+
+# --------------------------
+# REMOTE EXECUTION SCRIPT
+# --------------------------
+echo "#!/bin/ksh
+. /u01/app/oracle/.bash_profile
+export ORACLE_SID=+ASM
+sqlplus -s \"/ as sysdba\" @${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files.sql > ${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files_DG.sql
+echo \"exit;\" >> ${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files_DG.sql
+sqlplus \"/ as sysdba\" @${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files_DG.sql
+sqlplus \"/ as sysdba\" @${REMOTE_COPY_DG_STAGING_DIR}/asm_drop_files.sql
+rm -f ${ORACLE_ADMIN_DIR}/${AUXILIARY_DB}/*/*
+cp ${REMOTE_COPY_DG_STAGING_DIR}/initorclgs.ora ${ORACLE_HOME}/dbs/initorclgs.ora
+export ORACLE_SID=orclgs
+sqlplus \"/ as sysdba\" <<EOF
+CREATE SPFILE='+ORCL_DATA1/ORCLGS/spfileorclgs.ora' FROM PFILE='?/dbs/initorclgs.ora';
+EOF
+cd $ORACLE_HOME/dbs
+echo "SPFILE='+ORCL_DATA1/ORCLGS/spfileorclgs.ora'" > initorclgs.ora
+"  > ${REMOTE_COPY_DG_STAGING_DIR}/remote_execution_script.ksh
+
+chmod 755 ${REMOTE_COPY_DG_STAGING_DIR}/remote_execution_script.ksh
+
+
+wl "+----------------------------------------------------------------------------+"
+wl "| SEND RMAN BACKUPSETS TO REMOTE SERVER                                      |"
+wl "| -------------------------------------------------------------------------- |"
+wl "| All files that would be required to create a standby database or simply    |"
+wl "| recover the target database will be included.                              |"
+wl "+----------------------------------------------------------------------------+"
+
+wl "Copying new files to remote server..."
+date
+${REMOTE_COPY_BINARY} ${REMOTE_COPY_DG_STAGING_DIR}/* oracle@${REMOTE_COPY_SERVER}:${REMOTE_COPY_DG_STAGING_DIR}
+date
+
+
+wl "+----------------------------------------------------------------------------+"
+wl "| RUN SHELL SCRIPTS ON REMOTE HOST                                           |"
+wl "| -------------------------------------------------------------------------- |"
+wl "|   - Remove files from ASM for previous standby database.                   |"
+wl "+----------------------------------------------------------------------------+"
+
+${REMOTE_SHELL_BINARY} ${REMOTE_COPY_SERVER} "${REMOTE_COPY_DG_STAGING_DIR}/remote_execution_script.ksh"
+
+
+wl " "
+wl "+------------------------------------------------------------------------------+"
+wl "| ENDING SCRIPT.                                                               |"
+wl "+------------------------------------------------------------------------------+"
+
+endScript
+
+if [[ $ERRORS = "YES" ]]; then
+    exitFailed "FAILED" $UNIQUE_SCRIPT_IDENTIFIER
+else
+    exitSuccess "SUCCESSFUL" $UNIQUE_SCRIPT_IDENTIFIER
+fi
